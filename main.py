@@ -269,7 +269,7 @@ async def send_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_music(update, context)
         else:
             await context.bot.send_message(
-                chat_id=current_song['chat_id'],
+                chat_id=current_song['chat_id'], # This line was the problem for 'send_music'
                 text="🎵 Queue is empty! Add more songs with /play"
             )
             
@@ -364,104 +364,9 @@ async def skip_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if music_queue:
         await send_music(update, context)
     else:
+        # Corrected line: Use update.message.chat_id instead of current_song['chat_id']
         await context.bot.send_message(
-                chat_id=current_song['chat_id'],
-                text="🎵 Queue is empty! Add more songs with /play"
-            )
-            
-    except Exception as e:
-        await context.bot.send_message(
-            chat_id=current_song['chat_id'],
-            text=f"❌ Playback error: {str(e)}"
-        )
-        logger.error(f"Playback error: {str(e)}")
-    finally:
-        # Cleanup temp files
-        try:
-            import shutil
-            shutil.rmtree(temp_dir)
-        except Exception as e: # Catch any exception during cleanup
-            logger.error(f"Error cleaning up temp directory {temp_dir}: {e}") # Log cleanup errors
-
-async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    
-    if user_id in banned_users:
-        await update.message.reply_text("🚫 You are banned from using this bot.")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("Please specify a search query after /search")
-        return
-    
-    query = ' '.join(context.args)
-    
-    try:
-        searching_msg = await update.message.reply_text("🔍 Searching...")
-        
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch5:{query}", download=False)
-            
-            if not info['entries']:
-                await searching_msg.edit_text("❌ No results found")
-                return
-            
-            results = []
-            for i, entry in enumerate(info['entries'][:5], 1):
-                duration = entry.get('duration', 0)
-                duration_str = f"{duration//60}:{duration%60:02d}" if duration else "Unknown"
-                results.append(f"{i}. **{entry['title']}**\n    ⏱️ {duration_str} | 👤 {entry.get('uploader', 'Unknown')}")
-            
-            await searching_msg.edit_text(
-                f"🔍 **Search Results for:** {query}\n\n" + "\n\n".join(results),
-                parse_mode='Markdown'
-            )
-            
-    except Exception as e:
-        await update.message.reply_text(f"❌ Search error: {str(e)}")
-
-async def show_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not music_queue:
-        await update.message.reply_text("📭 Queue is empty!")
-        return
-    
-    queue_text = "🎵 **Current Queue:**\n\n"
-    for i, song in enumerate(music_queue[:10], 1):  # Show first 10 songs
-        duration = song['duration']
-        duration_str = f"{duration//60}:{duration%60:02d}" if duration else "Unknown"
-        queue_text += f"{i}. **{song['title']}**\n    ⏱️ {duration_str} | 👤 @{song['username']}\n\n"
-    
-    if len(music_queue) > 10:
-        queue_text += f"... and {len(music_queue) - 10} more songs"
-    
-    await update.message.reply_text(queue_text, parse_mode='Markdown')
-
-async def skip_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat.id
-    user_id = update.message.from_user.id
-    
-    if not music_queue:
-        await update.message.reply_text("📭 No songs in queue to skip!")
-        return
-    
-    # Check if user is admin or the one who requested the song
-    if not is_admin(user_id, chat_id) and music_queue[0]['requested_by'] != user_id:
-        await update.message.reply_text("❌ Only admins or the song requester can skip songs")
-        return
-    
-    skipped_song = music_queue.pop(0)
-    await update.message.reply_text(f"⏭️ Skipped: {skipped_song['title']}")
-    
-    if music_queue:
-        await send_music(update, context)
-    else:
-        await context.bot.send_message(
-            chat_id=current_song['chat_id'], # ERROR HERE: current_song not defined
+            chat_id=update.message.chat_id,
             text="🎵 Queue is empty! Add more songs with /play"
         )
 
@@ -692,4 +597,164 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = int(context.args[0])
         banned_users.discard(user_id)
-        await update.message
+        await update.message.reply_text(f"✅ User {user_id} has been unbanned.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.")
+
+async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Admin only command!")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: `/broadcast <message>`", parse_mode='Markdown')
+        return
+    
+    message = ' '.join(context.args)
+    sent_count = 0
+    
+    for user_id, user_data in user_messages.items():
+        try:
+            await context.bot.send_message(
+                chat_id=user_data['chat_id'],
+                text=f"📢 **Broadcast:** {message}",
+                parse_mode='Markdown'
+            )
+            sent_count += 1
+        except Exception as e:
+            logger.error(f"Failed to send broadcast to {user_id}: {e}")
+    
+    await update.message.reply_text(f"📢 Broadcast sent to {sent_count} users!")
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Admin only command!")
+        return
+    
+    stats = f"""
+📊 **Bot Statistics:**
+
+👥 **Users:** {len(user_messages)}
+🚫 **Banned Users:** {len(banned_users)}
+💬 **Groups:** {len(group_settings)}
+🎵 **Queue Length:** {len(music_queue)}
+👋 **Welcome Messages:** {len(welcome_messages)}
+    """
+    await update.message.reply_text(stats, parse_mode='Markdown')
+
+# ====================== DATA MANAGEMENT ======================
+
+async def save_group_data():
+    try:
+        data = {
+            'settings': group_settings,
+            'welcome': welcome_messages,
+            'banned_users': list(banned_users)
+        }
+        # Render's filesystem is ephemeral for free tiers, but group_data.json
+        # will persist across deployments. However, if the service restarts,
+        # in-memory global variables will be reset. For true persistence across restarts,
+        # you'd need a database (e.g., PostgreSQL, MongoDB).
+        with open('group_data.json', 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving data: {e}")
+
+async def load_group_data():
+    try:
+        with open('group_data.json') as f:
+            data = json.load(f)
+            group_settings.update(data.get('settings', {}))
+            welcome_messages.update(data.get('welcome', {}))
+            banned_users.update(data.get('banned_users', []))
+        logger.info("Existing data loaded successfully.")
+    except (FileNotFoundError, json.JSONDecodeError):
+        logger.info("No existing data file found or file is empty/corrupt, starting fresh.")
+
+# ====================== ERROR HANDLER ======================
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log the error and send a message to the user."""
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+    
+    if update and update.message:
+        await update.message.reply_text(
+            "❌ An internal error occurred. My apologies! Please try again later."
+        )
+
+# ====================== MAIN ======================
+
+async def main():
+    """Start the bot."""
+    await load_group_data()
+    
+    # Create the Application
+    application = Application.builder().token(TOKEN).build()
+    
+    # Conversation handler for welcome messages
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(handle_settings_callback, pattern='^set_welcome_')],
+        states={
+            WAITING_WELCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_welcome_message)]
+        },
+        fallbacks=[
+            CommandHandler('cancel', lambda u, c: ConversationHandler.END) # Optional: Add a way to cancel
+        ]
+    )
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    
+    # Music handlers
+    application.add_handler(CommandHandler("play", play_music))
+    application.add_handler(CommandHandler("search", search_music))
+    application.add_handler(CommandHandler("queue", show_queue))
+    application.add_handler(CommandHandler("skip", skip_song))
+    application.add_handler(CommandHandler("clear", clear_queue))
+    application.add_handler(CommandHandler("np", now_playing)) 
+    application.add_handler(CommandHandler("shuffle", shuffle_queue)) 
+    application.add_handler(CommandHandler("remove", remove_song)) 
+    application.add_handler(CommandHandler("lyrics", lyrics_search)) 
+    application.add_handler(CommandHandler("volume", set_volume)) 
+    application.add_handler(CommandHandler("mystats", user_stats)) 
+    
+    # Group management
+    application.add_handler(CommandHandler("setup", setup_group))
+    application.add_handler(CommandHandler("settings", group_settings_menu))
+    
+    # Admin commands
+    application.add_handler(CommandHandler("admin", forward_to_admin)) 
+    application.add_handler(CommandHandler("reply", admin_reply))
+    application.add_handler(CommandHandler("ban", ban_user))
+    application.add_handler(CommandHandler("unban", unban_user))
+    application.add_handler(CommandHandler("broadcast", broadcast_message))
+    application.add_handler(CommandHandler("stats", show_stats))
+    
+    # Other handlers
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(handle_settings_callback))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forward_to_admin)) 
+    
+    # Error handler
+    application.add_error_handler(error_handler)
+    
+    logger.info("Bot is starting...")
+    try:
+        # Run the bot's polling with explicit close_loop=False
+        await application.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+    except Exception as e:
+        logger.error(f"Error during bot polling: {e}")
+    finally:
+        # Explicitly stop the application. This helps clean up resources.
+        logger.info("Bot is shutting down gracefully...")
+        await application.stop()
+        logger.info("Bot application stopped.")
+
+
+if __name__ == '__main__':
+    # For Render, you directly run the main bot process.
+    # No keep_alive Flask server is needed as Render manages the service.
+    # The try/finally in main() handles the graceful shutdown.
+    asyncio.run(main())
