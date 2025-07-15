@@ -1,23 +1,29 @@
 import os
 import logging
 import json
-from io import BytesIO
+import asyncio
+import tempfile
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 from dotenv import load_dotenv
+
+# Updated imports for modern telegram bot
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Updater,
+    Application,
     CommandHandler,
     MessageHandler,
-    Filters,
-    CallbackContext,
     CallbackQueryHandler,
-    ConversationHandler
+    ConversationHandler,
+    filters,
+    ContextTypes
 )
 
-# Audio processing imports
-import youtube_dl
-import ffmpeg
-import requests
+# Modern audio processing imports
+import yt_dlp
+import aiohttp
+import asyncio
+from pathlib import Path
 
 # Load environment variables
 load_dotenv()
@@ -37,60 +43,110 @@ banned_users = set()
 music_queue = []
 group_settings = {}
 welcome_messages = {}
+user_limits = {}  # Rate limiting
 
 # Conversation states
 WAITING_WELCOME = 1
 
+# Rate limiting configuration
+RATE_LIMIT_MESSAGES = 5
+RATE_LIMIT_WINDOW = 60  # seconds
+
+# ====================== UTILITY FUNCTIONS ======================
+
+def check_rate_limit(user_id: int) -> bool:
+    """Check if user has exceeded rate limit"""
+    now = datetime.now()
+    if user_id not in user_limits:
+        user_limits[user_id] = []
+    
+    # Remove old entries
+    user_limits[user_id] = [
+        timestamp for timestamp in user_limits[user_id]
+        if now - timestamp < timedelta(seconds=RATE_LIMIT_WINDOW)
+    ]
+    
+    if len(user_limits[user_id]) >= RATE_LIMIT_MESSAGES:
+        return False
+    
+    user_limits[user_id].append(now)
+    return True
+
+def is_admin(user_id: int, chat_id: int) -> bool:
+    """Check if user is admin in group"""
+    if user_id == ADMIN_ID:
+        return True
+    return chat_id in group_settings and user_id in group_settings[chat_id].get('admins', [])
+
 # ====================== CORE FUNCTIONS ======================
 
-def start(update: Update, context: CallbackContext):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
-    update.message.reply_text(
+    await update.message.reply_text(
         f"🎵 Hello {user.first_name}! I'm Muskan Music Bot!\n"
         "Use /help to see available commands."
     )
 
-def help(update: Update, context: CallbackContext):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
-    🎶 Available Commands:
-    
-    🔊 Music:
-    /play <song> - Play a song (192kbps HQ)
-    /search <song> - Search for songs
-    /queue - Show current playlist
-    
-    👥 Group Management:
-    /setup - Initialize bot in group
-    /settings - Configure group
-    /welcome <msg> - Set welcome message
-    
-    💬 Chat:
-    /admin <message> - Contact admin
-    /reply <user_id> <msg> - Reply to user (Admin only)
-    
-    ⚙️ Admin:
-    /ban <user_id> - Ban user
-    /unban <user_id> - Unban user
-    /broadcast <msg> - Send to all users
+🎶 *Available Commands:*
+
+🔊 *Music:*
+/play <song> - Play a song (192kbps HQ)
+/search <song> - Search for songs
+/queue - Show current playlist
+/skip - Skip current song
+/clear - Clear playlist
+
+👥 *Group Management:*
+/setup - Initialize bot in group
+/settings - Configure group
+/welcome <msg> - Set welcome message
+
+💬 *Chat:*
+/admin <message> - Contact admin
+/reply <user_id> <msg> - Reply to user (Admin only)
+
+⚙️ *Admin Only:*
+/ban <user_id> - Ban user
+/unban <user_id> - Unban user
+/broadcast <msg> - Send to all users
+/stats - Show bot statistics
     """
-    update.message.reply_text(help_text)
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
 # ====================== IMPROVED MUSIC FUNCTIONS ======================
 
-def play_music(update: Update, context: CallbackContext):
-    # Check if music is enabled in group
+async def play_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
     chat_id = update.message.chat.id
-    if chat_id in group_settings and not group_settings[chat_id]['music_enabled']:
-        update.message.reply_text("❌ Music is disabled in this group")
+    
+    # Check bans and rate limits
+    if user_id in banned_users:
+        await update.message.reply_text("🚫 You are banned from using this bot.")
         return
     
+    if not check_rate_limit(user_id):
+        await update.message.reply_text("⏰ Please wait before sending another command.")
+        return
+    
+    # Check if music is enabled in group
+    if chat_id < 0:  # Group chat
+        if chat_id not in group_settings or not group_settings[chat_id].get('music_enabled', True):
+            await update.message.reply_text("❌ Music is disabled in this group")
+            return
+    
     if not context.args:
-        update.message.reply_text("Please specify a song after /play")
+        await update.message.reply_text("Please specify a song after /play\nExample: `/play Never Gonna Give You Up`", parse_mode='Markdown')
         return
     
     query = ' '.join(context.args)
+    
     try:
-        # HQ audio settings
+        # Send "searching" message
+        searching_msg = await update.message.reply_text("🔍 Searching for your song...")
+        
+        # Modern yt-dlp configuration
         ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -99,222 +155,560 @@ def play_music(update: Update, context: CallbackContext):
                 'preferredquality': '192',
             }],
             'quiet': True,
+            'no_warnings': True,
             'extractaudio': True,
-            'audioformat': 'mp3'
+            'audioformat': 'mp3',
+            'outtmpl': '%(title)s.%(ext)s'
         }
         
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch:{query}", download=False)['entries'][0]
-            audio_url = info['url']
-            title = info['title']
-            duration = info['duration']
-            
-            if duration > 900:  # 15 minute limit
-                update.message.reply_text("❌ Videos longer than 15 minutes aren't supported")
-                return
-        
-        # Add to queue with metadata
-        music_queue.append({
-            'url': audio_url,
-            'title': title,
-            'requested_by': update.message.from_user.id,
-            'chat_id': chat_id
-        })
-        
-        update.message.reply_text(f"🎧 Added to queue: {title}")
-        
-        if len(music_queue) == 1:
-            send_music(update, context)
-            
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                info = ydl.extract_info(f"ytsearch:{query}", download=False)
+                if not info['entries']:
+                    await searching_msg.edit_text("❌ No songs found for your query")
+                    return
+                    
+                video_info = info['entries'][0]
+                title = video_info['title']
+                duration = video_info.get('duration', 0)
+                uploader = video_info.get('uploader', 'Unknown')
+                
+                if duration > 900:  # 15 minute limit
+                    await searching_msg.edit_text("❌ Songs longer than 15 minutes aren't supported")
+                    return
+                
+                # Add to queue
+                music_queue.append({
+                    'info': video_info,
+                    'title': title,
+                    'duration': duration,
+                    'uploader': uploader,
+                    'requested_by': user_id,
+                    'chat_id': chat_id,
+                    'username': update.message.from_user.username or update.message.from_user.first_name
+                })
+                
+                duration_str = f"{duration//60}:{duration%60:02d}" if duration else "Unknown"
+                await searching_msg.edit_text(
+                    f"🎧 *Added to queue:*\n"
+                    f"🎵 {title}\n"
+                    f"⏱️ Duration: {duration_str}\n"
+                    f"👤 By: {uploader}\n"
+                    f"📍 Position: {len(music_queue)}",
+                    parse_mode='Markdown'
+                )
+                
+                # Start playing if this is the first song
+                if len(music_queue) == 1:
+                    await send_music(update, context)
+                    
+            except Exception as e:
+                await searching_msg.edit_text(f"❌ Error searching: {str(e)}")
+                logger.error(f"Search error: {str(e)}")
+                
     except Exception as e:
-        update.message.reply_text(f"❌ Error: {str(e)}")
+        await update.message.reply_text(f"❌ Unexpected error: {str(e)}")
         logger.error(f"Music error: {str(e)}")
 
-def send_music(update: Update, context: CallbackContext):
+async def send_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not music_queue:
         return
         
     current_song = music_queue[0]
+    temp_dir = tempfile.mkdtemp()
+    
     try:
-        # Stream HQ audio
-        audio_data = BytesIO(requests.get(current_song['url']).content)
-        audio_data.name = 'song.mp3'
-        
-        context.bot.send_audio(
+        # Send "downloading" message
+        downloading_msg = await context.bot.send_message(
             chat_id=current_song['chat_id'],
-            audio=audio_data,
-            title=current_song['title'],
-            performer=f"Requested by {user_messages.get(current_song['requested_by'], {}).get('username', 'Anonymous')}",
-            parse_mode='HTML'
+            text="⬇️ Downloading song..."
         )
         
+        # Download with yt-dlp
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+            'quiet': True,
+            'no_warnings': True
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([current_song['info']['webpage_url']])
+        
+        # Find the downloaded file
+        downloaded_files = list(Path(temp_dir).glob('*.mp3'))
+        if not downloaded_files:
+            await downloading_msg.edit_text("❌ Download failed")
+            return
+            
+        audio_file = downloaded_files[0]
+        
+        # Check file size (50MB limit)
+        if audio_file.stat().st_size > 50 * 1024 * 1024:
+            await downloading_msg.edit_text("❌ File too large (>50MB)")
+            return
+        
+        await downloading_msg.edit_text("📤 Uploading song...")
+        
+        # Send the audio file
+        with open(audio_file, 'rb') as audio:
+            await context.bot.send_audio(
+                chat_id=current_song['chat_id'],
+                audio=audio,
+                title=current_song['title'],
+                performer=current_song['uploader'],
+                duration=current_song['duration'],
+                caption=f"🎵 Requested by @{current_song['username']}"
+            )
+        
+        await downloading_msg.delete()
+        
+        # Remove from queue and play next
         music_queue.pop(0)
         if music_queue:
-            send_music(update, context)
+            await send_music(update, context)
+        else:
+            await context.bot.send_message(
+                chat_id=current_song['chat_id'],
+                text="🎵 Queue is empty! Add more songs with /play"
+            )
             
     except Exception as e:
-        update.message.reply_text(f"❌ Playback error: {str(e)}")
+        await context.bot.send_message(
+            chat_id=current_song['chat_id'],
+            text=f"❌ Playback error: {str(e)}"
+        )
+        logger.error(f"Playback error: {str(e)}")
+    finally:
+        # Cleanup temp files
+        try:
+            import shutil
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+
+async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    
+    if user_id in banned_users:
+        await update.message.reply_text("🚫 You are banned from using this bot.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Please specify a search query after /search")
+        return
+    
+    query = ' '.join(context.args)
+    
+    try:
+        searching_msg = await update.message.reply_text("🔍 Searching...")
+        
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch5:{query}", download=False)
+            
+            if not info['entries']:
+                await searching_msg.edit_text("❌ No results found")
+                return
+            
+            results = []
+            for i, entry in enumerate(info['entries'][:5], 1):
+                duration = entry.get('duration', 0)
+                duration_str = f"{duration//60}:{duration%60:02d}" if duration else "Unknown"
+                results.append(f"{i}. **{entry['title']}**\n   ⏱️ {duration_str} | 👤 {entry.get('uploader', 'Unknown')}")
+            
+            await searching_msg.edit_text(
+                f"🔍 **Search Results for:** {query}\n\n" + "\n\n".join(results),
+                parse_mode='Markdown'
+            )
+            
+    except Exception as e:
+        await update.message.reply_text(f"❌ Search error: {str(e)}")
+
+async def show_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not music_queue:
+        await update.message.reply_text("📭 Queue is empty!")
+        return
+    
+    queue_text = "🎵 **Current Queue:**\n\n"
+    for i, song in enumerate(music_queue[:10], 1):  # Show first 10 songs
+        duration = song['duration']
+        duration_str = f"{duration//60}:{duration%60:02d}" if duration else "Unknown"
+        queue_text += f"{i}. **{song['title']}**\n   ⏱️ {duration_str} | 👤 @{song['username']}\n\n"
+    
+    if len(music_queue) > 10:
+        queue_text += f"... and {len(music_queue) - 10} more songs"
+    
+    await update.message.reply_text(queue_text, parse_mode='Markdown')
+
+async def skip_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat.id
+    user_id = update.message.from_user.id
+    
+    if not music_queue:
+        await update.message.reply_text("📭 No songs in queue to skip!")
+        return
+    
+    # Check if user is admin or the one who requested the song
+    if not is_admin(user_id, chat_id) and music_queue[0]['requested_by'] != user_id:
+        await update.message.reply_text("❌ Only admins or the song requester can skip songs")
+        return
+    
+    skipped_song = music_queue.pop(0)
+    await update.message.reply_text(f"⏭️ Skipped: {skipped_song['title']}")
+    
+    if music_queue:
+        await send_music(update, context)
+    else:
+        await update.message.reply_text("🎵 Queue is empty!")
+
+async def clear_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat.id
+    user_id = update.message.from_user.id
+    
+    if not is_admin(user_id, chat_id):
+        await update.message.reply_text("❌ Only admins can clear the queue")
+        return
+    
+    music_queue.clear()
+    await update.message.reply_text("🗑️ Queue cleared!")
 
 # ====================== GROUP MANAGEMENT ======================
 
-def setup_group(update: Update, context: CallbackContext):
+async def setup_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat.id
+    user_id = update.message.from_user.id
+    
+    if chat_id > 0:  # Private chat
+        await update.message.reply_text("❌ This command is for groups only")
+        return
+    
     if chat_id not in group_settings:
         group_settings[chat_id] = {
-            'admins': [update.message.from_user.id],
+            'admins': [user_id],
             'music_enabled': True,
             'welcome_enabled': False
         }
-        save_group_data()
-        update.message.reply_text("✅ Group setup complete! Use /settings to configure")
+        await save_group_data()
+        await update.message.reply_text("✅ Group setup complete! Use /settings to configure")
     else:
-        update.message.reply_text("ℹ️ Group already setup")
+        await update.message.reply_text("ℹ️ Group already setup")
 
-def group_settings_menu(update: Update, context: CallbackContext):
+async def group_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat.id
-    if chat_id not in group_settings:
-        update.message.reply_text("❌ Group not setup. Use /setup first")
+    user_id = update.message.from_user.id
+    
+    if chat_id > 0:
+        await update.message.reply_text("❌ This command is for groups only")
         return
     
+    if not is_admin(user_id, chat_id):
+        await update.message.reply_text("❌ Only admins can access settings")
+        return
+    
+    if chat_id not in group_settings:
+        await update.message.reply_text("❌ Group not setup. Use /setup first")
+        return
+    
+    settings = group_settings[chat_id]
+    music_status = "🔊 ON" if settings['music_enabled'] else "🔇 OFF"
+    welcome_status = "✅ ON" if settings['welcome_enabled'] else "❌ OFF"
+    
     keyboard = [
-        [InlineKeyboardButton("Toggle Music", callback_data=f'toggle_music_{chat_id}')],
-        [InlineKeyboardButton("Set Welcome", callback_data=f'set_welcome_{chat_id}')],
-        [InlineKeyboardButton("Admin List", callback_data=f'admin_list_{chat_id}')]
+        [InlineKeyboardButton(f"Music: {music_status}", callback_data=f'toggle_music_{chat_id}')],
+        [InlineKeyboardButton(f"Welcome: {welcome_status}", callback_data=f'toggle_welcome_{chat_id}')],
+        [InlineKeyboardButton("👥 Admin List", callback_data=f'admin_list_{chat_id}')],
+        [InlineKeyboardButton("🔧 Set Welcome Message", callback_data=f'set_welcome_{chat_id}')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    update.message.reply_text(
-        "⚙️ Group Settings:",
-        reply_markup=reply_markup
+    await update.message.reply_text(
+        "⚙️ **Group Settings:**\n\n"
+        f"🎵 Music: {music_status}\n"
+        f"👋 Welcome: {welcome_status}\n"
+        f"👥 Admins: {len(settings['admins'])}",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
     )
 
-def handle_settings_callback(update: Update, context: CallbackContext):
+async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await query.answer()
+    
     data = query.data.split('_')
     action = data[0]
+    feature = data[1]
     chat_id = int(data[2])
     
     if action == 'toggle':
-        group_settings[chat_id]['music_enabled'] = not group_settings[chat_id]['music_enabled']
-        status = "ON" if group_settings[chat_id]['music_enabled'] else "OFF"
-        query.edit_message_text(f"🎵 Music is now {status}")
+        if feature == 'music':
+            group_settings[chat_id]['music_enabled'] = not group_settings[chat_id]['music_enabled']
+            status = "ON" if group_settings[chat_id]['music_enabled'] else "OFF"
+            await query.edit_message_text(f"🎵 Music is now {status}")
+        elif feature == 'welcome':
+            group_settings[chat_id]['welcome_enabled'] = not group_settings[chat_id]['welcome_enabled']
+            status = "ON" if group_settings[chat_id]['welcome_enabled'] else "OFF"
+            await query.edit_message_text(f"👋 Welcome messages are now {status}")
     
-    elif action == 'set':
-        query.edit_message_text("Send your welcome message now:")
+    elif action == 'admin' and feature == 'list':
+        admins = group_settings[chat_id]['admins']
+        admin_list = "\n".join([f"• {admin_id}" for admin_id in admins])
+        await query.edit_message_text(f"👥 **Group Admins:**\n{admin_list}", parse_mode='Markdown')
+    
+    elif action == 'set' and feature == 'welcome':
+        await query.edit_message_text("Send your welcome message now:")
         return WAITING_WELCOME
     
-    save_group_data()
+    await save_group_data()
 
-def set_welcome_message(update: Update, context: CallbackContext):
+async def set_welcome_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat.id
     welcome_messages[chat_id] = update.message.text
     group_settings[chat_id]['welcome_enabled'] = True
-    save_group_data()
-    update.message.reply_text("✅ Welcome message set!")
+    await save_group_data()
+    await update.message.reply_text("✅ Welcome message set!")
     return ConversationHandler.END
 
-def welcome_new_member(update: Update, context: CallbackContext):
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat.id
     if chat_id in group_settings and group_settings[chat_id]['welcome_enabled']:
         for user in update.message.new_chat_members:
             if user.id == context.bot.id:
                 continue  # Skip bot's own join
-            update.message.reply_text(
-                welcome_messages.get(chat_id, "Welcome to the group!").replace("{name}", user.first_name)
+            message = welcome_messages.get(chat_id, "👋 Welcome to the group, {name}!")
+            await update.message.reply_text(
+                message.replace("{name}", user.first_name),
+                parse_mode='Markdown'
             )
 
 # ====================== ADMIN FUNCTIONS ======================
 
-def forward_to_admin(update: Update, context: CallbackContext):
+async def forward_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     
     if user.id in banned_users:
-        update.message.reply_text("🚫 You are banned from using this bot.")
+        await update.message.reply_text("🚫 You are banned from using this bot.")
+        return
+    
+    if not check_rate_limit(user.id):
+        await update.message.reply_text("⏰ Please wait before sending another message.")
         return
     
     user_messages[user.id] = {
         'username': user.username or user.first_name,
-        'chat_id': update.message.chat_id
+        'chat_id': update.message.chat_id,
+        'first_name': user.first_name
     }
     
-    context.bot.send_message(
+    await context.bot.send_message(
         chat_id=ADMIN_ID,
-        text=f"📩 New message from {user.username or user.first_name} (ID: {user.id}):\n{update.message.text}"
+        text=f"📩 **New message from** {user.first_name} (@{user.username or 'no_username'})\n"
+             f"**ID:** {user.id}\n"
+             f"**Message:** {update.message.text}",
+        parse_mode='Markdown'
     )
-    update.message.reply_text("✅ Your message has been sent to admin!")
+    await update.message.reply_text("✅ Your message has been sent to admin!")
 
-def admin_reply(update: Update, context: CallbackContext):
+async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
-        update.message.reply_text("❌ Admin only command!")
+        await update.message.reply_text("❌ Admin only command!")
         return
         
     if len(context.args) < 2:
-        update.message.reply_text("Usage: /reply <user_id> <message>")
+        await update.message.reply_text("Usage: `/reply <user_id> <message>`", parse_mode='Markdown')
         return
     
-    user_id = int(context.args[0])
-    message = ' '.join(context.args[1:])
+    try:
+        user_id = int(context.args[0])
+        message = ' '.join(context.args[1:])
+        
+        if user_id in user_messages:
+            await context.bot.send_message(
+                chat_id=user_messages[user_id]['chat_id'],
+                text=f"💌 **Admin reply:** {message}",
+                parse_mode='Markdown'
+            )
+            await update.message.reply_text(f"✅ Reply sent to {user_messages[user_id]['first_name']}!")
+        else:
+            await update.message.reply_text("❌ User not found or hasn't messaged the bot.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.")
+
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Admin only command!")
+        return
     
-    if user_id in user_messages:
-        context.bot.send_message(
-            chat_id=user_messages[user_id]['chat_id'],
-            text=f"💌 Admin reply: {message}"
-        )
-        update.message.reply_text(f"✅ Reply sent to {user_messages[user_id]['username']}!")
-    else:
-        update.message.reply_text("❌ User not found.")
+    if not context.args:
+        await update.message.reply_text("Usage: `/ban <user_id>`", parse_mode='Markdown')
+        return
+    
+    try:
+        user_id = int(context.args[0])
+        banned_users.add(user_id)
+        await update.message.reply_text(f"🚫 User {user_id} has been banned.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.")
+
+async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Admin only command!")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: `/unban <user_id>`", parse_mode='Markdown')
+        return
+    
+    try:
+        user_id = int(context.args[0])
+        banned_users.discard(user_id)
+        await update.message.reply_text(f"✅ User {user_id} has been unbanned.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.")
+
+async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Admin only command!")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: `/broadcast <message>`", parse_mode='Markdown')
+        return
+    
+    message = ' '.join(context.args)
+    sent_count = 0
+    
+    for user_id, user_data in user_messages.items():
+        try:
+            await context.bot.send_message(
+                chat_id=user_data['chat_id'],
+                text=f"📢 **Broadcast:** {message}",
+                parse_mode='Markdown'
+            )
+            sent_count += 1
+        except Exception as e:
+            logger.error(f"Failed to send broadcast to {user_id}: {e}")
+    
+    await update.message.reply_text(f"📢 Broadcast sent to {sent_count} users!")
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Admin only command!")
+        return
+    
+    stats = f"""
+📊 **Bot Statistics:**
+
+👥 **Users:** {len(user_messages)}
+🚫 **Banned Users:** {len(banned_users)}
+💬 **Groups:** {len(group_settings)}
+🎵 **Queue Length:** {len(music_queue)}
+👋 **Welcome Messages:** {len(welcome_messages)}
+    """
+    await update.message.reply_text(stats, parse_mode='Markdown')
 
 # ====================== DATA MANAGEMENT ======================
 
-def save_group_data():
-    with open('group_data.json', 'w') as f:
-        json.dump({
+async def save_group_data():
+    try:
+        data = {
             'settings': group_settings,
-            'welcome': welcome_messages
-        }, f)
+            'welcome': welcome_messages,
+            'banned_users': list(banned_users)
+        }
+        with open('group_data.json', 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving data: {e}")
 
-def load_group_data():
+async def load_group_data():
     try:
         with open('group_data.json') as f:
             data = json.load(f)
             group_settings.update(data.get('settings', {}))
             welcome_messages.update(data.get('welcome', {}))
+            banned_users.update(data.get('banned_users', []))
     except (FileNotFoundError, json.JSONDecodeError):
-        pass
+        logger.info("No existing data file found, starting fresh")
+
+# ====================== ERROR HANDLER ======================
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log the error and send a message to the user."""
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+    
+    if update and update.message:
+        await update.message.reply_text(
+            "❌ An error occurred while processing your request. Please try again later."
+        )
 
 # ====================== MAIN ======================
 
-def main():
-    load_group_data()
-    updater = Updater(TOKEN, use_context=True)
-    dp = updater.dispatcher
-
+async def main():
+    """Start the bot."""
+    await load_group_data()
+    
+    # Create the Application
+    application = Application.builder().token(TOKEN).build()
+    
     # Conversation handler for welcome messages
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(handle_settings_callback, pattern='^set_welcome_')],
         states={
-            WAITING_WELCOME: [MessageHandler(Filters.text & ~Filters.command, set_welcome_message)]
+            WAITING_WELCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_welcome_message)]
         },
         fallbacks=[]
     )
-
-    # Handlers
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("help", help))
-    dp.add_handler(CommandHandler("play", play_music))
-    dp.add_handler(CommandHandler("setup", setup_group))
-    dp.add_handler(CommandHandler("settings", group_settings_menu))
-    dp.add_handler(CommandHandler("reply", admin_reply))
     
-    dp.add_handler(conv_handler)
-    dp.add_handler(CallbackQueryHandler(handle_settings_callback))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, forward_to_admin))
-    dp.add_handler(MessageHandler(Filters.status_update.new_chat_members, welcome_new_member))
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
     
-    # Start the Bot
-    updater.start_polling()
-    logger.info("Bot is running with all features...")
-    updater.idle()
+    # Music handlers
+    application.add_handler(CommandHandler("play", play_music))
+    application.add_handler(CommandHandler("search", search_music))
+    application.add_handler(CommandHandler("queue", show_queue))
+    application.add_handler(CommandHandler("skip", skip_song))
+    application.add_handler(CommandHandler("clear", clear_queue))
+    application.add_handler(CommandHandler("np", now_playing))
+    application.add_handler(CommandHandler("shuffle", shuffle_queue))
+    application.add_handler(CommandHandler("remove", remove_song))
+    application.add_handler(CommandHandler("lyrics", lyrics_search))
+    application.add_handler(CommandHandler("volume", set_volume))
+    application.add_handler(CommandHandler("mystats", user_stats))
+    
+    # Group management
+    application.add_handler(CommandHandler("setup", setup_group))
+    application.add_handler(CommandHandler("settings", group_settings_menu))
+    
+    # Admin commands
+    application.add_handler(CommandHandler("reply", admin_reply))
+    application.add_handler(CommandHandler("ban", ban_user))
+    application.add_handler(CommandHandler("unban", unban_user))
+    application.add_handler(CommandHandler("broadcast", broadcast_message))
+    application.add_handler(CommandHandler("stats", show_stats))
+    
+    # Other handlers
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(handle_settings_callback))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forward_to_admin))
+    
+    # Error handler
+    application.add_error_handler(error_handler)
+    
+    # Start the bot
+    logger.info("Bot is starting...")
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
